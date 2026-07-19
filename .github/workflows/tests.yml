@@ -2,17 +2,19 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, testing]
     paths-ignore:
       - '*.md'
       - 'backup_*/**'
       - '.gitignore'
   pull_request:
-    branches: [main]
+    branches: [main, testing]
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      UV_VERSION: '0.11.23'
     steps:
       - uses: actions/checkout@v4
 
@@ -22,16 +24,101 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install lockfile tool
         run: |
-          pip install -r requirements.txt
-          pip install pytest pytest-asyncio
+          python -m pip install "uv==$UV_VERSION"
 
-      - name: Run local tests (no API key needed)
-        run: python -m pytest tests/test_scoring.py tests/test_feel_flow.py -v --asyncio-mode=auto
+      - name: Verify dependency lockfiles
+        run: |
+          uv pip compile requirements.txt --universal --python-version 3.12 --generate-hashes --output-file requirements.lock.txt
+          uv pip compile requirements-dev.in --universal --python-version 3.12 --generate-hashes --output-file requirements-dev.lock.txt
+          git diff --exit-code -- requirements.lock.txt requirements-dev.lock.txt
+
+      - name: Install locked dependencies
+        run: uv pip sync requirements-dev.lock.txt --require-hashes --system
+
+      - name: Run static checks
+        run: ruff check src tools deploy tests --no-cache
+
+      - name: Run security checks
+        run: |
+          bandit -r src tools deploy -ll -ii -q
+          pip-audit -r requirements.lock.txt
+
+      - name: Generate production dependency SBOM
+        run: >-
+          cyclonedx-py requirements requirements.lock.txt
+          --spec-version 1.6
+          --output-reproducible
+          --output-format JSON
+          --output-file sbom.cdx.json
+
+      - name: Upload dependency SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: ombre-brain-python-sbom
+          path: sbom.cdx.json
+
+      - name: Run full local suite with coverage
+        run: >-
+          python -m pytest tests -q
+          --asyncio-mode=auto
+          --cov=src
+          --cov-report=term-missing
+          --cov-report=xml
+          --cov-fail-under=60
 
       - name: Run LLM quality tests
-        if: env.OMBRE_API_KEY != ''
+        if: env.OMBRE_COMPRESS_API_KEY != ''
         env:
-          OMBRE_API_KEY: ${{ secrets.OMBRE_API_KEY }}
+          OMBRE_COMPRESS_API_KEY: ${{ secrets.OMBRE_COMPRESS_API_KEY }}
         run: python -m pytest tests/test_llm_quality.py -v --asyncio-mode=auto
+
+      - name: Start isolated Docker MCP stack
+        run: |
+          docker network create ob-ci-net
+          docker volume create ob-ci-data
+          docker run -d --name ob-ci-llm --network ob-ci-net \
+            -v "$PWD:/workspace:ro" -w /workspace python:3.12-slim \
+            python tests/mcp_llm_stub.py
+          docker build -t ombre-brain-ci:local .
+          docker run -d --name ob-ci-app --network ob-ci-net \
+            -p 127.0.0.1:18084:8000 \
+            -v ob-ci-data:/app/buckets \
+            -e OMBRE_COMPRESS_MODEL=ombre-stub \
+            -e OMBRE_COMPRESS_API_FORMAT=openai_compat \
+            -e OMBRE_COMPRESS_API_KEY=audit-key \
+            -e OMBRE_COMPRESS_BASE_URL=http://ob-ci-llm:8080/v1 \
+            -e OMBRE_MCP_REQUIRE_AUTH=false \
+            -e OMBRE_SETUP_TOKEN=docker-audit-setup-token \
+            ombre-brain-ci:local
+          for attempt in $(seq 1 60); do
+            curl --fail --silent http://127.0.0.1:18084/health && break
+            if [ "$attempt" -eq 60 ]; then
+              docker logs ob-ci-app
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Run 14-tool Docker MCP integration suite
+        env:
+          OMBRE_DOCKER_INTEGRATION_URL: http://127.0.0.1:18084/mcp
+        run: >-
+          python -m pytest tests/test_mcp_tools_docker_integration.py -q
+          --timeout=60
+
+      - name: Run Docker Web management integration suite
+        env:
+          OMBRE_DOCKER_WEB_BASE_URL: http://127.0.0.1:18084
+          OMBRE_DOCKER_SETUP_TOKEN: docker-audit-setup-token
+        run: >-
+          python -m pytest tests/test_web_api_docker_integration.py -q
+          --timeout=120
+
+      - name: Clean Docker MCP stack
+        if: always()
+        run: |
+          docker rm -f ob-ci-app ob-ci-llm || true
+          docker volume rm ob-ci-data || true
+          docker network rm ob-ci-net || true

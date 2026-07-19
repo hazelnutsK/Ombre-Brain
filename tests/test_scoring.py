@@ -71,7 +71,6 @@ class TestTimeWeight:
 
     def test_half_life_25h(self, decay_eng):
         """Half-life at t=36*ln(2)≈24.9h (~1.04 days) → bonus halved → 1.5"""
-        import math
         half_life_days = 36.0 * math.log(2) / 24.0  # ≈1.039 days
         assert decay_eng._calc_time_weight(half_life_days) == pytest.approx(1.5, rel=0.01)
 

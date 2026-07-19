@@ -13,10 +13,27 @@
 
 import os
 import pytest
-import asyncio
 import pytest_asyncio
 
 # Feel flow tests use direct BucketManager calls, no LLM needed.
+
+
+class _FakeEmbeddingEngine:
+    """这里不验证 embedding 本身，给一个永远成功的假引擎。"""
+
+    enabled = True
+
+    async def generate_and_store(self, bucket_id, content):
+        return True
+
+    def delete_embedding(self, bucket_id):
+        pass
+
+    async def get_embedding(self, bucket_id):
+        return [0.1, 0.2, 0.3]
+
+    async def search_similar(self, query, top_k=10):
+        return []
 
 
 @pytest_asyncio.fixture
@@ -29,7 +46,6 @@ async def isolated_tools(test_config, tmp_path, monkeypatch):
     monkeypatch.setenv("OMBRE_BUCKETS_DIR", str(tmp_path / "buckets"))
 
     # Create directory structure
-    import os
     bd = str(tmp_path / "buckets")
     for d in ["permanent", "dynamic", "archive", "dynamic/feel"]:
         os.makedirs(os.path.join(bd, d), exist_ok=True)
@@ -51,7 +67,7 @@ async def isolated_tools(test_config, tmp_path, monkeypatch):
     from decay_engine import DecayEngine
     from dehydrator import Dehydrator
 
-    bm = BucketManager(test_config | {"buckets_dir": bd})
+    bm = BucketManager(test_config | {"buckets_dir": bd}, embedding_engine=_FakeEmbeddingEngine())
     dh = Dehydrator(test_config)
     de = DecayEngine(test_config, bm)
 
@@ -89,7 +105,6 @@ class TestFeelLifecycle:
     async def test_feel_in_feel_directory(self, isolated_tools):
         """Feel bucket stored under feel/沉淀物/."""
         bm, dh, de, bd = isolated_tools
-        import os
 
         bid = await bm.create(
             content="这是一条 feel 测试",
@@ -106,7 +121,6 @@ class TestFeelLifecycle:
     async def test_feel_retrieval_by_time(self, isolated_tools):
         """Feel buckets retrieved in reverse chronological order."""
         bm, dh, de, bd = isolated_tools
-        import os, time
         import frontmatter as fm
         from datetime import datetime, timedelta
 
@@ -135,6 +149,11 @@ class TestFeelLifecycle:
             post["last_active"] = ts
             with open(fpath, "w", encoding="utf-8") as f:
                 f.write(fm.dumps(post))
+
+        # 本测试绕过 bucket_mgr 直接改文件（改 created 时间戳），必须手动让活跃桶缓存失效，
+        # 否则下面的 list_all 会拿到改时间戳之前的缓存。生产里唯一直写 .md 的 GitHub 导入
+        # 同样在写完后调 _invalidate_bm25()（见 web/github.py），此处遵循同一契约。
+        bm._invalidate_bm25()
 
         all_b = await bm.list_all()
         feels = [b for b in all_b if b["metadata"].get("type") == "feel"]

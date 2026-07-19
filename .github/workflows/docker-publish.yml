@@ -1,5 +1,14 @@
 name: Build & Push Docker Image
 
+# 何时构建并推送镜像到 Docker Hub：
+#   - 每次 push 到 main（忽略纯文档改动）→ 自动重建并推 :latest + :<VERSION>
+#   - 也可在 Actions 页手动触发（Run workflow）
+#
+# 凭证只存在 GitHub 仓库 Secrets（绝不写进代码）：
+#   DOCKERHUB_USERNAME = p0luz
+#   DOCKERHUB_TOKEN    = Docker Hub Access Token（强烈建议用 token，不要用账号密码）
+# 设置位置：仓库 → Settings → Secrets and variables → Actions → New repository secret
+
 on:
   push:
     branches: [main]
@@ -7,12 +16,17 @@ on:
       - '*.md'
       - 'backup_*/**'
       - '.gitignore'
+  workflow_dispatch:
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Read version from VERSION file
+        id: ver
+        run: echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -31,6 +45,6 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: |
             p0luz/ombre-brain:latest
-            p0luz/ombre-brain:${{ github.sha }}
+            p0luz/ombre-brain:${{ steps.ver.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
