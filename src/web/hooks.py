@@ -37,6 +37,15 @@ _HOOK_RATE_GLOBAL_LIMIT = 60
 _HOOK_RATE_SOURCE_CAP = 2048
 _HOOK_MIN_BLOCK_TOKENS = 120
 _hook_slots = threading.BoundedSemaphore(_HOOK_CONCURRENCY)
+
+# recall 与 breath-hook 分开限并发：recall 每轮对话都打、要快，不该跟开场那次
+# 昂贵的 handoff 抢同一批槽位（反之亦然）。
+_RECALL_CONCURRENCY = 4
+_RECALL_TIMEOUT_SECONDS = 8.0
+_RECALL_QUERY_MAX_CHARS = 500
+_RECALL_CONFIRM_MAX_IDS = 32
+_RECALL_VECTOR_TOPK = 50
+_recall_slots = threading.BoundedSemaphore(_RECALL_CONCURRENCY)
 _hook_rate_lock = threading.Lock()
 _hook_source_events: OrderedDict[str, deque[float]] = OrderedDict()
 _hook_global_events: deque[float] = deque()
@@ -45,6 +54,13 @@ try:
     from utils import strip_wikilinks, count_tokens_approx, get_ai_name  # type: ignore
 except ImportError:  # pragma: no cover
     from ..utils import strip_wikilinks, count_tokens_approx, get_ai_name  # type: ignore
+
+try:
+    from ombrebrain.policy.surfacing import SurfacePolicyVM  # type: ignore
+except ImportError:  # pragma: no cover
+    from ..ombrebrain.policy.surfacing import SurfacePolicyVM  # type: ignore
+
+_RECALL_POLICY = SurfacePolicyVM.default()
 
 
 def _truthy(value) -> bool:
@@ -222,6 +238,85 @@ async def _timeout_after(seconds: float):
         raise
     finally:
         handle.cancel()
+
+
+def _clamp_int(value, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _recall_visible(bucket: dict) -> bool:
+    """Recall 的可见性边界与 breath_search 完全一致——不能因为换了个入口就多露东西。
+
+    feel/plan/letter 有各自的专用通道，不从这里出；dont_surface 只限制无参浮现，
+    检索仍可命中（与 tools/breath/search.py 同规则）。
+    """
+    try:
+        if not _RECALL_POLICY.evaluate_bucket(bucket, mode="search").allowed:
+            return False
+    except Exception:
+        return False
+    return (bucket.get("metadata") or {}).get("type") not in ("feel", "plan", "letter")
+
+
+async def _recall_semantic_scores(query: str) -> tuple[dict, str]:
+    """One vector query; degrade to keyword/BM25 instead of failing the request."""
+    engine = sh.embedding_engine
+    if not engine or not getattr(engine, "enabled", False):
+        return {}, "semantic_unavailable"
+    try:
+        strict = getattr(engine, "search_similar_strict", None)
+        pairs = await (
+            strict(query, top_k=_RECALL_VECTOR_TOPK)
+            if callable(strict)
+            else engine.search_similar(query, top_k=_RECALL_VECTOR_TOPK)
+        )
+        return {bucket_id: float(score) for bucket_id, score in pairs}, ""
+    except Exception as exc:
+        logger.warning(
+            "recall semantic search failed; keyword/BM25 only: %s: %s",
+            type(exc).__name__, exc,
+        )
+        return {}, "semantic_unavailable"
+
+
+def _recall_cards(buckets: list, char_budget: int, *, drift: bool = False) -> tuple[list, int]:
+    """Serialise buckets as structured cards under a total character budget.
+
+    正文**整条给或整条不给**，绝不截断——与 breath 的 token 预算同一条规矩：
+    半句记忆比没有记忆更糟。
+    """
+    cards: list = []
+    used = 0
+    for rank, bucket in enumerate(buckets):
+        meta = bucket.get("metadata") or {}
+        content = strip_wikilinks(str(bucket.get("content") or "")).strip()
+        if not content:
+            continue
+        if used + len(content) > char_budget:
+            break
+        try:
+            importance = int(meta.get("importance") or 0)
+        except (TypeError, ValueError):
+            importance = 0
+        cards.append({
+            "id": _bounded_text(bucket.get("id")),
+            "name": _bounded_text(meta.get("name") or bucket.get("id")),
+            "content": content,
+            "rank": rank,
+            "importance": importance,
+            "pinned": bool(meta.get("pinned") or meta.get("protected")),
+            "type": _bounded_text(meta.get("type"), 32),
+            "domain": [_bounded_text(d, 40) for d in (meta.get("domain") or []) if d][:8],
+            "created": _bounded_text(meta.get("created"), 40),
+            "vector_match": bool(bucket.get("vector_match")),
+            "drift": drift,
+        })
+        used += len(content)
+    return cards, used
 
 
 def register(mcp) -> None:
@@ -483,6 +578,144 @@ def register(mcp) -> None:
             return PlainTextResponse("", headers=no_store_headers)
         finally:
             _hook_slots.release()
+
+    # ------------------------------------------------------------------
+    # /api/recall —— 无状态检索，给「每轮自动浮现」的调用方用
+    #
+    # 与 /breath-hook 的分工：breath-hook 是开场一次的 handoff，读全库、走
+    # dehydrator，贵且慢；recall 是每轮一次的针对性检索，一次向量查询 +
+    # BM25 融合，不调 LLM、不读全库（drift 除外）。
+    #
+    # 刻意**不在这里 touch()**：调用方拿到候选后还要按自己的冷却规则丢掉一部分，
+    # 若在此处加固，被丢掉的桶等于被虚假激活——「用进废退」就失真了。真正浮到
+    # 对方眼前的那几条，由调用方回调 /api/recall/confirm 补记。
+    # ------------------------------------------------------------------
+    @mcp.custom_route("/api/recall", methods=["POST"])
+    async def api_recall(request):
+        from starlette.responses import JSONResponse
+
+        no_store = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+
+        # 这个端点每轮对话都会被打，成本敏感且会吐记忆正文：只认显式 hook token，
+        # 不接受 Dashboard cookie（避免浏览器里的登录态被跨站 POST 借用）。
+        if not _valid_hook_token(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401, headers=no_store)
+        if not _admit_hook_request(request):
+            return JSONResponse(
+                {"error": "rate_limited"}, status_code=429,
+                headers={**no_store, "Retry-After": "60"},
+            )
+        if not _recall_slots.acquire(blocking=False):
+            return JSONResponse(
+                {"error": "busy"}, status_code=429,
+                headers={**no_store, "Retry-After": "5"},
+            )
+
+        started = time.monotonic()
+        try:
+            try:
+                body = await sh._read_json_object(request)
+            except (ValueError, json.JSONDecodeError):
+                return JSONResponse({"error": "bad_json"}, status_code=400, headers=no_store)
+
+            query = str(body.get("query") or "").strip()
+            if not query:
+                return JSONResponse({"error": "empty_query"}, status_code=400, headers=no_store)
+            query = query[:_RECALL_QUERY_MAX_CHARS]
+            max_results = _clamp_int(body.get("max_results"), 8, 1, 20)
+            max_chars = _clamp_int(body.get("max_chars"), 4000, 200, 20_000)
+            drift = _truthy(body.get("drift"))
+
+            async with _timeout_after(_RECALL_TIMEOUT_SECONDS):
+                vector_scores, degraded = await _recall_semantic_scores(query)
+                try:
+                    matches = await sh.bucket_mgr.search(
+                        query,
+                        limit=max(max_results, 20),
+                        vector_scores=vector_scores,
+                    )
+                except Exception as exc:
+                    logger.warning("recall search failed: %s: %s", type(exc).__name__, exc)
+                    return JSONResponse(
+                        {"error": "search_failed"}, status_code=503, headers=no_store,
+                    )
+
+                matches = [b for b in matches if _recall_visible(b)][:max_results]
+                cards, used = _recall_cards(matches, max_chars)
+
+                # 命中太少时的「忽然想起来」：从低权重旧桶里随机漂几条上来。
+                # 读全库，只在调用方明确要（drift=true）且确实没什么命中时才做。
+                if drift and len(cards) < 3:
+                    try:
+                        all_buckets = await sh.bucket_mgr.list_all(include_archive=False)
+                        hit_ids = {c["id"] for c in cards}
+                        low = [
+                            b for b in all_buckets
+                            if b["id"] not in hit_ids
+                            and _recall_visible(b)
+                            and sh.decay_engine.calculate_score(b["metadata"]) < 2.0
+                        ]
+                        if low:
+                            slots = max(0, max_results - len(cards))
+                            picked = random.sample(
+                                low, min(random.randint(1, 3), len(low), slots)
+                            )
+                            drift_cards, _ = _recall_cards(
+                                picked, max_chars - used, drift=True,
+                            )
+                            cards.extend(drift_cards)
+                    except Exception as exc:
+                        logger.warning("recall drift failed: %s", exc)
+
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                return JSONResponse(
+                    {
+                        "cards": cards,
+                        "degraded": degraded,
+                        "elapsed_ms": elapsed_ms,
+                    },
+                    headers=no_store,
+                )
+        except TimeoutError:
+            logger.warning("recall exceeded %ss timeout", _RECALL_TIMEOUT_SECONDS)
+            return JSONResponse(
+                {"error": "timeout", "cards": []}, status_code=504,
+                headers={**no_store, "Retry-After": "10"},
+            )
+        except Exception as exc:
+            logger.warning("recall failed: %s: %s", type(exc).__name__, exc)
+            return JSONResponse({"error": "internal", "cards": []}, status_code=500, headers=no_store)
+        finally:
+            _recall_slots.release()
+
+    # ------------------------------------------------------------------
+    # /api/recall/confirm —— 调用方回报「这几条真的浮到眼前了」
+    #
+    # 这才是 touch 该发生的地方：只有真正进了对方视野的记忆才算被想起，
+    # 才配加固。fire-and-forget，调用方不必等。
+    # ------------------------------------------------------------------
+    @mcp.custom_route("/api/recall/confirm", methods=["POST"])
+    async def api_recall_confirm(request):
+        from starlette.responses import JSONResponse
+
+        no_store = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+        if not _valid_hook_token(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401, headers=no_store)
+
+        try:
+            body = await sh._read_json_object(request)
+        except (ValueError, json.JSONDecodeError):
+            return JSONResponse({"error": "bad_json"}, status_code=400, headers=no_store)
+
+        raw_ids = body.get("ids")
+        if not isinstance(raw_ids, list):
+            return JSONResponse({"error": "ids_must_be_list"}, status_code=400, headers=no_store)
+        ids = [str(i)[:200] for i in raw_ids if str(i or "").strip()][:_RECALL_CONFIRM_MAX_IDS]
+        if not ids:
+            return JSONResponse({"touched": 0}, headers=no_store)
+
+        asyncio.create_task(sh.bucket_mgr.touch_many(ids, ripple=False))
+        return JSONResponse({"touched": len(ids)}, status_code=202, headers=no_store)
 
     # 注意：这里**故意不再提供 /dream-hook**。
     # 按 OB 的设计哲学，dream（做梦消化）不是义务、不该在每次会话开始被自动触发——
