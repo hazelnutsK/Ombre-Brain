@@ -50,6 +50,9 @@ class _Manager:
         self.searched.append((query, limit, kwargs))
         return list(self.buckets)
 
+    # bucket_mgr.search 真实实现会在返回的 bucket 上写 score / vector_match，
+    # 测试里由 _bucket(...) 直接带上。
+
     async def list_all(self, include_archive=False):
         return list(self.buckets)
 
@@ -159,6 +162,25 @@ async def test_recall_returns_structured_cards_without_touching(monkeypatch):
     assert body["degraded"] == ""
     # 关键：候选还没经过调用方的冷却过滤，此刻加固就是虚假激活。
     assert manager.touched == []
+
+
+@pytest.mark.asyncio
+async def test_recall_reports_scores_for_gate_tuning(monkeypatch):
+    """光看「浮了几条」判断不了浮得准不准，调用方要靠 score 分布调阈值。"""
+    buckets = [_bucket("cat", "她养的猫叫十九"), _bucket("far", "无关的旧事")]
+    buckets[0]["score"] = 8.75
+    buckets[0]["vector_match"] = True
+    buckets[1]["score"] = 1.2
+    monkeypatch.setattr(
+        hooks.sh, "embedding_engine", _Engine([("cat", 0.8123456)]), raising=False
+    )
+    handler, _ = _recall(monkeypatch, buckets)
+    body = _payload(await handler(_Request({"query": "猫"})))
+
+    hit, far = body["cards"]
+    assert hit["score"] == 8.75 and far["score"] == 1.2
+    assert hit["semantic"] == 0.8123, "纯向量余弦要带出来，且不被截断成布尔"
+    assert far["semantic"] is None, "没走向量通道的不编造分数"
 
 
 @pytest.mark.asyncio

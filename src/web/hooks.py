@@ -283,14 +283,26 @@ async def _recall_semantic_scores(query: str) -> tuple[dict, str]:
         return {}, "semantic_unavailable"
 
 
-def _recall_cards(buckets: list, char_budget: int, *, drift: bool = False) -> tuple[list, int]:
+def _recall_cards(
+    buckets: list,
+    char_budget: int,
+    *,
+    drift: bool = False,
+    vector_scores: dict | None = None,
+) -> tuple[list, int]:
     """Serialise buckets as structured cards under a total character budget.
 
     正文**整条给或整条不给**，绝不截断——与 breath 的 token 预算同一条规矩：
     半句记忆比没有记忆更糟。
+
+    带上分数是给调用方调门控用的：光看「浮了几条」判断不了浮得准不准，要看
+    score 的分布才知道阈值该往哪边挪。score 是 bucket_mgr 的 7 维融合分
+    （topic/emotion/time/importance/touch/semantic/BM25 加权后归一化），
+    semantic 是那条的纯向量余弦（没走向量通道的为 None）。
     """
     cards: list = []
     used = 0
+    scores = vector_scores or {}
     for rank, bucket in enumerate(buckets):
         meta = bucket.get("metadata") or {}
         content = strip_wikilinks(str(bucket.get("content") or "")).strip()
@@ -302,11 +314,14 @@ def _recall_cards(buckets: list, char_budget: int, *, drift: bool = False) -> tu
             importance = int(meta.get("importance") or 0)
         except (TypeError, ValueError):
             importance = 0
+        semantic = scores.get(bucket.get("id"))
         cards.append({
             "id": _bounded_text(bucket.get("id")),
             "name": _bounded_text(meta.get("name") or bucket.get("id")),
             "content": content,
             "rank": rank,
+            "score": float(bucket.get("score") or 0.0),
+            "semantic": round(float(semantic), 4) if semantic is not None else None,
             "importance": importance,
             "pinned": bool(meta.get("pinned") or meta.get("protected")),
             "type": _bounded_text(meta.get("type"), 32),
@@ -641,7 +656,7 @@ def register(mcp) -> None:
                     )
 
                 matches = [b for b in matches if _recall_visible(b)][:max_results]
-                cards, used = _recall_cards(matches, max_chars)
+                cards, used = _recall_cards(matches, max_chars, vector_scores=vector_scores)
 
                 # 命中太少时的「忽然想起来」：从低权重旧桶里随机漂几条上来。
                 # 读全库，只在调用方明确要（drift=true）且确实没什么命中时才做。
@@ -662,6 +677,7 @@ def register(mcp) -> None:
                             )
                             drift_cards, _ = _recall_cards(
                                 picked, max_chars - used, drift=True,
+                                vector_scores=vector_scores,
                             )
                             cards.extend(drift_cards)
                     except Exception as exc:
