@@ -45,8 +45,9 @@ class BM25Index:
     """内存 BM25 倒排索引门面。
 
     lifecycle:
-        build(buckets)  — 重建索引（BucketManager 在写操作后脏标记，search 时懒调用）
-        score(query)    — 返回 {bucket_id: normalized_score}，分值 [0, 1]
+        build(buckets)      — 重建索引（BucketManager 在写操作后脏标记，search 时懒调用）
+        score(query)        — 返回 {bucket_id: normalized_score}，分值 [0, 1]
+        score_pairs(query)  — 返回 {bucket_id: (normalized, raw)}，调门控要用 raw
     """
 
     def __init__(self):
@@ -83,6 +84,18 @@ class BM25Index:
 
     def score(self, query: str) -> dict[str, float]:
         """返回 {bucket_id: normalized_bm25_score}，最高分 = 1.0，无命中返回 {}。"""
+        return {bid: norm for bid, (norm, _raw) in self.score_pairs(query).items()}
+
+    def score_pairs(self, query: str) -> dict[str, tuple[float, float]]:
+        """返回 {bucket_id: (normalized, raw)}。
+
+        **normalized 排序，raw 过门——两者必须分开。**
+
+        max 归一把本轮最强的那条拉成 1.0，不管它的绝对强度低到什么程度。
+        她说「呜呜呜不管 打滚」时，某条记忆凭一个「打滚」就能拿满分进池，
+        raw 其实弱得可以忽略。用归一分做「浮不浮」的判断,等于宣布
+        「每轮总有一条最相关」——但很多轮她根本没在说任何值得想起的事。
+        """
         if not _BM25_AVAILABLE or self._index is None:
             return {}
         tokens = _tokenize(query)
@@ -92,4 +105,8 @@ class BM25Index:
         max_s = float(raw.max()) if raw.size > 0 else 0.0
         if max_s <= 0:
             return {}
-        return {bid: float(s) / max_s for bid, s in zip(self._ids, raw) if s > 0}
+        return {
+            bid: (float(s) / max_s, float(s))
+            for bid, s in zip(self._ids, raw)
+            if s > 0
+        }

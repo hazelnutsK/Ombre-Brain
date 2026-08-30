@@ -2343,6 +2343,7 @@ class BucketManager:
         query_valence: Optional[float] = None,
         query_arousal: Optional[float] = None,
         vector_scores: Optional[dict[str, float]] = None,
+        timings: Optional[dict] = None,
     ) -> list[dict]:
         """
         Multi-dimensional indexed search for memory buckets.
@@ -2357,7 +2358,10 @@ class BucketManager:
         limit = limit or self.max_results
         # 字面召回：把查询原样（小写、去空白）留作子串匹配，保证显式搜的词必被召回
         q_norm = query.strip().lower()
+        _t_stage = time.monotonic()
         all_buckets = await self.list_all(include_archive=False)
+        if timings is not None:
+            timings["list_all_ms"] = int((time.monotonic() - _t_stage) * 1000)
 
         if not all_buckets:
             return []
@@ -2420,20 +2424,26 @@ class BucketManager:
         # --- BM25 打分（性能 P4：脏了就后台线程重建，不在请求里同步阻塞 ~17s）---
         # 脏且没人在重建 → 起一个后台重建；本次查询用「当前索引」打分（首次为空，
         # 之后是上一版，略旧但有效）。向量+模糊+字面召回仍在，单次查询不会因 BM25 卡住。
-        bm25_scores: dict[str, float] = {}
+        # (normalized, raw) 两个都留着:normalized 进加权和管排序,raw 挂到
+        # score_parts 上给调用方过绝对门。见 bm25_index.score_pairs 的注释。
+        bm25_pairs: dict[str, tuple[float, float]] = {}
+        _t_stage = time.monotonic()
         if self._bm25 is not None:
             if self._bm25_dirty and not self._bm25_rebuilding:
                 self._bm25_rebuilding = True
                 asyncio.create_task(self._rebuild_bm25_async(all_buckets))
             try:
-                bm25_scores = self._bm25.score(query)
+                bm25_pairs = self._bm25.score_pairs(query)
             except Exception as e:
                 logger.warning(f"[bm25] score 失败，本次跳过 BM25 维度: {e}")
-                bm25_scores = {}
+                bm25_pairs = {}
+        if timings is not None:
+            timings["bm25_ms"] = int((time.monotonic() - _t_stage) * 1000)
 
         # --- Layer 2: weighted multi-dim ranking ---
         # --- 第二层：多维加权精排 ---
         scored = []
+        _t_stage = time.monotonic()
         for bucket in candidates:
             meta = bucket.get("metadata", {})
 
@@ -2484,9 +2494,10 @@ class BucketManager:
                 if semantic_score is not None:
                     total += semantic_score * self.w_semantic
                     weight_sum += self.w_semantic
-                # Dim 7: BM25 TF-IDF 关键词分（rank_bm25+jieba，软依赖，缺包时 bm25_scores={}）
-                if bm25_scores:
-                    total += bm25_scores.get(bucket["id"], 0.0) * self.w_bm25
+                # Dim 7: BM25 TF-IDF 关键词分（rank_bm25+jieba，软依赖，缺包时 bm25_pairs={}）
+                bm25_norm, bm25_raw = bm25_pairs.get(bucket["id"], (0.0, 0.0))
+                if bm25_pairs:
+                    total += bm25_norm * self.w_bm25
                     weight_sum += self.w_bm25
                 # Normalize to 0~100 for readability
                 normalized = (total / weight_sum) * 100 if weight_sum > 0 else 0
@@ -2511,6 +2522,27 @@ class BucketManager:
                     if meta.get("resolved", False):
                         normalized *= _RESOLVED_RANK_PENALTY
                     bucket["score"] = round(normalized, 2)
+                    # 分车道原始证据。score 是 7 维加权归一后的**排序分**,其中
+                    # emotion/time/importance/touch 跟「这条记忆和当前这句话相不相关」
+                    # 无关却占了 41~58% 的权重,加上 fuzzy_threshold=50 的准入门,
+                    # 实测分布挤在 50~65 的窄带里,拿它当相关性阈值是错的。
+                    # 判断「该不该浮」只能看下面这几条车道的绝对值。
+                    bucket["score_parts"] = {
+                        # —— 跟查询有关的证据 ——
+                        "topic": round(float(topic_score), 4),
+                        "semantic": (
+                            round(float(semantic_score), 4)
+                            if semantic_score is not None else None
+                        ),
+                        "bm25_norm": round(float(bm25_norm), 4),   # 池内相对,排序用
+                        "bm25_raw": round(float(bm25_raw), 4),     # 绝对强度,过门用
+                        "literal": bool(literal_hit),
+                        # —— 与查询无关,只是记忆自身属性(50 分地板的来源) ——
+                        "emotion": round(float(emotion_score), 4),
+                        "time": round(float(time_score), 4),
+                        "importance": round(float(importance_score), 4),
+                        "touch": round(float(touch_score), 4),
+                    }
                     if semantic_match and not text_match:
                         bucket["vector_match"] = True
                     else:
@@ -2524,6 +2556,11 @@ class BucketManager:
                 continue
 
         scored.sort(key=lambda x: x["score"], reverse=True)
+        if timings is not None:
+            # 计时要盖住排序本身 —— 叫 rank 就得含 ranking,不然名不副实
+            timings["rank_ms"] = int((time.monotonic() - _t_stage) * 1000)
+            timings["candidates"] = len(candidates)
+            timings["scored"] = len(scored)
         return scored[:limit]
 
     # ---------------------------------------------------------

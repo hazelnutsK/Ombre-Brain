@@ -262,6 +262,14 @@ def _recall_visible(bucket: dict) -> bool:
     return (bucket.get("metadata") or {}).get("type") not in ("feel", "plan", "letter")
 
 
+def _sanitize_trace_id(raw) -> str:
+    """调用方给的 trace_id 会原样进日志行 —— 只留字母数字和 -_,并截断。
+
+    不做这层过滤的话,一个带换行的 trace_id 就能在日志里伪造出一整行。
+    """
+    return "".join(ch for ch in str(raw or "") if ch.isalnum() or ch in "-_")[:32]
+
+
 async def _recall_semantic_scores(query: str) -> tuple[dict, str]:
     """One vector query; degrade to keyword/BM25 instead of failing the request."""
     engine = sh.embedding_engine
@@ -295,10 +303,17 @@ def _recall_cards(
     正文**整条给或整条不给**，绝不截断——与 breath 的 token 预算同一条规矩：
     半句记忆比没有记忆更糟。
 
-    带上分数是给调用方调门控用的：光看「浮了几条」判断不了浮得准不准，要看
-    score 的分布才知道阈值该往哪边挪。score 是 bucket_mgr 的 7 维融合分
-    （topic/emotion/time/importance/touch/semantic/BM25 加权后归一化），
-    semantic 是那条的纯向量余弦（没走向量通道的为 None）。
+    带上分数是给调用方调门控用的：光看「浮了几条」判断不了浮得准不准。
+
+    score 是 bucket_mgr 的 7 维融合分（topic/emotion/time/importance/touch/
+    semantic/BM25 加权后归一化），semantic 是纯向量余弦（没走向量通道的为 None）。
+    **但 score 只能用来排序,不能用来判断「该不该浮」**：它有近一半权重来自
+    emotion/time/importance/touch 这些与当前查询无关的维度,加上 fuzzy_threshold=50
+    的准入门,实测分布挤在 50~65 的窄带里,在上面切阈值等于切噪声。
+
+    score_parts 是分车道的原始证据（见 bucket_manager 里那段注释）,浮不浮要看它:
+    bm25_raw 是绝对强度（bm25_norm 是池内归一,弱查询里最强的那条也会被拉成 1.0）,
+    semantic 是余弦绝对值,topic 是模糊匹配率,literal 是整串命中。
     """
     cards: list = []
     used = 0
@@ -322,6 +337,7 @@ def _recall_cards(
             "rank": rank,
             "score": float(bucket.get("score") or 0.0),
             "semantic": round(float(semantic), 4) if semantic is not None else None,
+            "score_parts": bucket.get("score_parts") or {},
             "importance": importance,
             "pinned": bool(meta.get("pinned") or meta.get("protected")),
             "type": _bounded_text(meta.get("type"), 32),
@@ -627,11 +643,20 @@ def register(mcp) -> None:
             )
 
         started = time.monotonic()
+        # trace_id 由**调用方生成并随请求传进来**,这里只是复用。
+        # 反过来(服务端生成、随响应返回)在最需要它的场景下恰好失效:relay 的预算
+        # 只有 2s 而这里是 8s,relay 超时那几轮压根拿不到响应,也就拿不到 id——
+        # 而那正是唯一需要对账的场景(「relay 放弃了,服务端到底跑了多久?」)。
+        # 调用方没给才自己编一个,兼容直接打这个端点的场景。
+        trace_id = os.urandom(4).hex()
+        timings: dict = {}
         try:
             try:
                 body = await sh._read_json_object(request)
             except (ValueError, json.JSONDecodeError):
                 return JSONResponse({"error": "bad_json"}, status_code=400, headers=no_store)
+
+            trace_id = _sanitize_trace_id(body.get("trace_id")) or trace_id
 
             query = str(body.get("query") or "").strip()
             if not query:
@@ -642,12 +667,15 @@ def register(mcp) -> None:
             drift = _truthy(body.get("drift"))
 
             async with _timeout_after(_RECALL_TIMEOUT_SECONDS):
+                _t_stage = time.monotonic()
                 vector_scores, degraded = await _recall_semantic_scores(query)
+                timings["semantic_ms"] = int((time.monotonic() - _t_stage) * 1000)
                 try:
                     matches = await sh.bucket_mgr.search(
                         query,
                         limit=max(max_results, 20),
                         vector_scores=vector_scores,
+                        timings=timings,
                     )
                 except Exception as exc:
                     logger.warning("recall search failed: %s: %s", type(exc).__name__, exc)
@@ -656,7 +684,9 @@ def register(mcp) -> None:
                     )
 
                 matches = [b for b in matches if _recall_visible(b)][:max_results]
+                _t_stage = time.monotonic()
                 cards, used = _recall_cards(matches, max_chars, vector_scores=vector_scores)
+                timings["serialize_ms"] = int((time.monotonic() - _t_stage) * 1000)
 
                 # 命中太少时的「忽然想起来」：从低权重旧桶里随机漂几条上来。
                 # 读全库，只在调用方明确要（drift=true）且确实没什么命中时才做。
@@ -684,23 +714,49 @@ def register(mcp) -> None:
                         logger.warning("recall drift failed: %s", exc)
 
                 elapsed_ms = int((time.monotonic() - started) * 1000)
+                timings["server_total_ms"] = elapsed_ms
+                # 也写服务端日志:relay 超时放弃的那些轮次拿不到这个响应,
+                # 只有这里留得下记录。
+                logger.info(
+                    "[recall] trace=%s cards=%d %s",
+                    trace_id, len(cards),
+                    " ".join(f"{k}={v}" for k, v in sorted(timings.items())),
+                )
                 return JSONResponse(
                     {
                         "cards": cards,
                         "degraded": degraded,
                         "elapsed_ms": elapsed_ms,
+                        "trace_id": trace_id,
+                        "timings": timings,
                     },
                     headers=no_store,
                 )
         except TimeoutError:
-            logger.warning("recall exceeded %ss timeout", _RECALL_TIMEOUT_SECONDS)
+            # 已经跑完的那几段仍然要吐出来——卡在哪一段,答案就在这行里。
+            # server_total_ms 在失败路径上同样要有,否则「跑了多久才放弃」没数。
+            timings["server_total_ms"] = int((time.monotonic() - started) * 1000)
+            logger.warning(
+                "[recall] trace=%s TIMEOUT after %ss  %s",
+                trace_id, _RECALL_TIMEOUT_SECONDS,
+                " ".join(f"{k}={v}" for k, v in sorted(timings.items())) or "(未完成任何阶段)",
+            )
             return JSONResponse(
-                {"error": "timeout", "cards": []}, status_code=504,
+                {"error": "timeout", "cards": [], "trace_id": trace_id, "timings": timings},
+                status_code=504,
                 headers={**no_store, "Retry-After": "10"},
             )
         except Exception as exc:
-            logger.warning("recall failed: %s: %s", type(exc).__name__, exc)
-            return JSONResponse({"error": "internal", "cards": []}, status_code=500, headers=no_store)
+            timings["server_total_ms"] = int((time.monotonic() - started) * 1000)
+            logger.warning(
+                "[recall] trace=%s FAILED %s: %s  %s",
+                trace_id, type(exc).__name__, exc,
+                " ".join(f"{k}={v}" for k, v in sorted(timings.items())),
+            )
+            return JSONResponse(
+                {"error": "internal", "cards": [], "trace_id": trace_id, "timings": timings},
+                status_code=500, headers=no_store,
+            )
         finally:
             _recall_slots.release()
 
